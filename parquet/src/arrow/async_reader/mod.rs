@@ -574,6 +574,33 @@ struct ReaderFactory<T> {
     max_predicate_cache_size: usize,
 }
 
+impl<T> ReaderFactory<T> {
+    fn row_group_ranges(
+        &self,
+        row_group_idx: usize,
+        selection: Option<RowSelection>,
+        projection: ProjectionMask,
+    ) -> Result<Vec<Range<u64>>> {
+        let meta = self.metadata.row_group(row_group_idx);
+        let offset_index = self
+            .metadata
+            .offset_index()
+            // filter out empty offset indexes (old versions specified Some(vec![]) when no present)
+            .filter(|index| !index.is_empty())
+            .map(|x| x[row_group_idx].as_slice());
+
+        let row_group = InMemoryRowGroup {
+            // schema: meta.schema_descr_ptr(),
+            row_count: meta.num_rows() as usize,
+            column_chunks: vec![None; meta.columns().len()],
+            offset_index,
+            row_group_idx,
+            metadata: self.metadata.as_ref(),
+        };
+        row_group.ranges(&projection, selection.as_ref())
+    }
+}
+
 impl<T> ReaderFactory<T>
 where
     T: AsyncFileReader + Send,
@@ -834,6 +861,25 @@ impl<T> ParquetRecordBatchStream<T> {
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }
+
+    /// Returns the parsed metadata associated with the parquet file.
+    pub fn metadata(&self) -> &ParquetMetaData {
+        &self.metadata
+    }
+
+    /// Returns the index of the next row group that will be processed by [`Self::next_row_group`], or `None` if the stream has completed.
+    pub fn next_row_group_index(&self) -> Option<usize> {
+        self.row_groups.front().copied()
+    }
+
+    /// Returns the ranges required to fetch the row group with the specified index, ignoring row selections & filters.
+    pub fn row_group_ranges(&self, row_group: usize) -> Result<Vec<Range<u64>>> {
+        assert!(self.selection.is_none(), "not yet implemented");
+        self.reader_factory
+            .as_ref()
+            .expect("lost reader factory")
+            .row_group_ranges(row_group, None, self.projection.clone())
+    }
 }
 
 impl<T> ParquetRecordBatchStream<T>
@@ -973,6 +1019,62 @@ struct InMemoryRowGroup<'a> {
 }
 
 impl InMemoryRowGroup<'_> {
+    fn ranges(
+        &self,
+        projection: &ProjectionMask,
+        selection: Option<&RowSelection>,
+    ) -> Result<Vec<Range<u64>>> {
+        let metadata = self.metadata.row_group(self.row_group_idx);
+        if let Some((selection, offset_index)) = selection.zip(self.offset_index) {
+            // If we have a `RowSelection` and an `OffsetIndex` then only fetch pages required for the
+            // `RowSelection`
+            let mut page_start_offsets: Vec<Vec<u64>> = vec![];
+
+            let fetch_ranges = self
+                .column_chunks
+                .iter()
+                .zip(metadata.columns())
+                .enumerate()
+                .filter(|&(idx, (chunk, _chunk_meta))| {
+                    chunk.is_none() && projection.leaf_included(idx)
+                })
+                .flat_map(|(idx, (_chunk, chunk_meta))| {
+                    // If the first page does not start at the beginning of the column,
+                    // then we need to also fetch a dictionary page.
+                    let mut ranges: Vec<Range<u64>> = vec![];
+                    let (start, _len) = chunk_meta.byte_range();
+                    match offset_index[idx].page_locations.first() {
+                        Some(first) if first.offset as u64 != start => {
+                            ranges.push(start..first.offset as u64);
+                        }
+                        _ => (),
+                    }
+
+                    // Expand selection to batch boundaries only for cached columns
+                    ranges.extend(selection.scan_ranges(&offset_index[idx].page_locations));
+
+                    page_start_offsets.push(ranges.iter().map(|range| range.start).collect());
+
+                    ranges
+                })
+                .collect();
+
+            Ok(fetch_ranges)
+        } else {
+            Ok(self
+                .column_chunks
+                .iter()
+                .enumerate()
+                .filter(|&(idx, chunk)| chunk.is_none() && projection.leaf_included(idx))
+                .map(|(idx, _chunk)| {
+                    let column = metadata.column(idx);
+                    let (start, length) = column.byte_range();
+                    start..(start + length)
+                })
+                .collect())
+        }
+    }
+
     /// Fetches any additional column data specified in `projection` that is not already
     /// present in `self.column_chunks`.
     ///
